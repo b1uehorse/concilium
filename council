@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# council — двусторонний мост между Claude Code и Gemini CLI
+# консилиум нейросетей: clipboard → gemini → clipboard
+set -euo pipefail
+
+# --- конфигурация ---
+COUNCIL_DIR="${HOME}/.council"
+SESSION_LOG="${COUNCIL_DIR}/session.md"
+ROUND_FILE="${COUNCIL_DIR}/.round"
+
+# --- определяем clipboard-команды по ОС ---
+detect_clipboard() {
+    case "$(uname -s)" in
+        Darwin)
+            CLIP_COPY="pbcopy"
+            CLIP_PASTE="pbpaste"
+            ;;
+        Linux)
+            CLIP_COPY="wl-copy"
+            CLIP_PASTE="wl-paste"
+            ;;
+        *)
+            echo "ошибка: неподдерживаемая ОС $(uname -s)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- инициализация рабочей директории ---
+init_dir() {
+    mkdir -p "${COUNCIL_DIR}"
+    if [[ ! -f "${ROUND_FILE}" ]]; then
+        echo "0" > "${ROUND_FILE}"
+    fi
+}
+
+# --- получить текущий раунд ---
+get_round() {
+    cat "${ROUND_FILE}"
+}
+
+# --- инкрементировать раунд ---
+next_round() {
+    local current
+    current="$(get_round)"
+    echo "$(( current + 1 ))" > "${ROUND_FILE}"
+    get_round
+}
+
+# --- определить режим ввода: pipe или interactive ---
+# при пайпе clipboard не трогаем вообще
+is_pipe_mode() {
+    [[ ! -t 0 ]]
+}
+
+# --- читать ввод: stdin (если пайп) или clipboard ---
+read_input() {
+    local content
+    if is_pipe_mode; then
+        content="$(cat)"
+    else
+        content="$($CLIP_PASTE 2>/dev/null)" || true
+    fi
+    if [[ -z "${content}" ]]; then
+        echo "ошибка: нет входных данных (clipboard пуст и stdin пуст)" >&2
+        exit 1
+    fi
+    echo "${content}"
+}
+
+# --- писать в clipboard ---
+write_clipboard() {
+    echo "$1" | $CLIP_COPY
+}
+
+# --- timestamp ---
+timestamp() {
+    date "+%H:%M:%S"
+}
+
+# --- записать в лог ---
+log_entry() {
+    local round="$1"
+    local source="$2"
+    local ts="$3"
+    local content="$4"
+
+    cat >> "${SESSION_LOG}" << EOF
+## round ${round} — ${source} (${ts})
+
+${content}
+
+---
+
+EOF
+}
+
+# --- проверить что gemini установлен ---
+check_gemini() {
+    if ! command -v gemini &>/dev/null; then
+        echo "ошибка: gemini cli не найден" >&2
+        echo "" >&2
+        echo "установи:" >&2
+        echo "  npm install -g @google/gemini-cli && gemini" >&2
+        echo "" >&2
+        echo "первый запуск попросит авторизацию через Google аккаунт" >&2
+        exit 1
+    fi
+}
+
+# --- определить системный промпт по роли ---
+get_system_prompt() {
+    local role="$1"
+    case "${role}" in
+        review)
+            echo "ты второй инженер на code review. проанализируй решение коллеги. укажи баги, слабые места, edge cases, потенциальные проблемы в production. если всё ок — скажи коротко что ок и почему. будь конкретен, без воды."
+            ;;
+        alt)
+            echo "предложи альтернативный подход к этой задаче. не критикуй исходное решение — покажи другой путь, объясни trade-offs."
+            ;;
+        devil)
+            echo "играй роль devil's advocate. найди все причины почему это решение может сломаться в production. подумай про edge cases, race conditions, масштабирование, человеческий фактор."
+            ;;
+        sql)
+            echo "ты senior DBA. проверь SQL/миграции/запросы на: deadlock потенциал, N+1, отсутствие индексов, implicit conversions, locking issues, data loss risks. будь конкретен."
+            ;;
+        sec)
+            echo "проведи security review. ищи: injection, auth bypass, secrets в коде, SSRF, path traversal, privilege escalation. будь конкретен."
+            ;;
+        *)
+            # кастомная роль — используем аргумент как системный промпт
+            echo "${role}"
+            ;;
+    esac
+}
+
+# --- отправить в gemini и получить ответ ---
+send_to_gemini() {
+    local system_prompt="$1"
+    local content="$2"
+    local full_prompt
+
+    full_prompt="${system_prompt}
+
+--- начало кода/текста для анализа ---
+
+${content}
+
+--- конец кода/текста для анализа ---"
+
+    # gemini -p принимает промпт как аргумент
+    gemini -p "${full_prompt}" 2>/dev/null
+}
+
+# --- форматировать ответ для clipboard ---
+format_response() {
+    local round="$1"
+    local role="$2"
+    local response="$3"
+
+    cat << EOF
+[консилиум round ${round} — ${role}]
+
+второй инженер (Gemini) говорит:
+
+${response}
+EOF
+}
+
+# --- основной флоу: stdin/clipboard → gemini → stdout/clipboard ---
+run_council() {
+    local role="${1:-review}"
+
+    check_gemini
+
+    # читаем ввод
+    local input
+    input="$(read_input)"
+
+    # инкрементируем раунд
+    local round
+    round="$(next_round)"
+
+    # логируем вход (CC)
+    local ts_in
+    ts_in="$(timestamp)"
+    log_entry "${round}" "CC" "${ts_in}" "${input}"
+
+    # определяем системный промпт
+    local system_prompt
+    system_prompt="$(get_system_prompt "${role}")"
+
+    # отправляем в gemini
+    echo "⏳ отправляю в gemini (роль: ${role}, раунд ${round})..." >&2
+    local response
+    response="$(send_to_gemini "${system_prompt}" "${input}")"
+
+    if [[ -z "${response}" ]]; then
+        echo "ошибка: gemini вернул пустой ответ" >&2
+        exit 1
+    fi
+
+    # логируем ответ (Gemini)
+    local ts_out
+    ts_out="$(timestamp)"
+    log_entry "${round}" "Gemini" "${ts_out}" "${response}"
+
+    # форматируем ответ
+    local formatted
+    formatted="$(format_response "${round}" "${role}" "${response}")"
+
+    if is_pipe_mode; then
+        # пайп — только stdout, clipboard не трогаем
+        echo "${formatted}"
+    else
+        # интерактив — в clipboard и stdout
+        write_clipboard "${formatted}"
+        echo "${formatted}"
+        echo "" >&2
+        echo "✅ раунд ${round} готов (роль: ${role})" >&2
+    fi
+}
+
+# --- loop режим ---
+run_loop() {
+    local count="${1:-3}"
+    local role="${2:-review}"
+
+    check_gemini
+
+    echo "🔄 запускаю loop: ${count} раундов (роль: ${role})" >&2
+    echo "" >&2
+
+    local i
+    for (( i = 1; i <= count; i++ )); do
+        echo "--- раунд ${i}/${count} ---" >&2
+
+        # читаем clipboard
+        local input
+        input="$(read_input)"
+
+        # инкрементируем раунд
+        local round
+        round="$(next_round)"
+
+        # логируем вход
+        local ts_in
+        ts_in="$(timestamp)"
+        log_entry "${round}" "CC" "${ts_in}" "${input}"
+
+        # отправляем в gemini
+        echo "⏳ отправляю в gemini..." >&2
+        local response
+        response="$(send_to_gemini "$(get_system_prompt "${role}")" "${input}")"
+
+        if [[ -z "${response}" ]]; then
+            echo "ошибка: gemini вернул пустой ответ" >&2
+            exit 1
+        fi
+
+        # логируем ответ
+        local ts_out
+        ts_out="$(timestamp)"
+        log_entry "${round}" "Gemini" "${ts_out}" "${response}"
+
+        # форматируем ответ
+        local formatted
+        formatted="$(format_response "${round}" "${role}" "${response}")"
+
+        if is_pipe_mode; then
+            echo "${formatted}"
+        else
+            write_clipboard "${formatted}"
+            echo "${formatted}"
+            echo "✅ ответ gemini в clipboard" >&2
+        fi
+
+        echo "" >&2
+
+        # если не последний раунд — ждём Enter
+        if (( i < count )); then
+            echo "👉 вставь ответ в CC, скопируй новый ответ CC, нажми Enter" >&2
+            read -r
+        fi
+    done
+
+    echo "🏁 loop завершён: ${count} раундов" >&2
+}
+
+# --- показать лог ---
+show_log() {
+    if [[ -f "${SESSION_LOG}" ]]; then
+        cat "${SESSION_LOG}"
+    else
+        echo "лог пуст"
+    fi
+}
+
+# --- очистить лог и раунды ---
+clear_session() {
+    rm -f "${SESSION_LOG}" "${ROUND_FILE}"
+    echo "0" > "${ROUND_FILE}"
+    echo "сессия очищена"
+}
+
+# --- справка ---
+show_help() {
+    cat << 'EOF'
+council — двусторонний мост между Claude Code и Gemini CLI
+
+использование:
+  council                       review: clipboard → gemini → clipboard
+  council alt                   альтернативный подход
+  council devil                 devil's advocate (найди почему сломается)
+  council sql                   DBA review (deadlocks, N+1, locking)
+  council sec                   security review
+  council "произвольный текст"  кастомная роль
+  council loop N [роль]         N раундов с паузами для ручной вставки
+  council log                   показать лог сессии
+  council clear                 очистить лог и сбросить раунды
+  council help                  эта справка
+
+роли:
+  review   — code review, баги, edge cases
+  alt      — альтернативный подход, trade-offs
+  devil    — devil's advocate, что сломается
+  sql      — DBA review: deadlocks, N+1, locking
+  sec      — security review: injection, auth bypass, SSRF
+
+ввод:
+  echo "текст" | council sql    stdin → stdout (clipboard не трогает)
+  council sql                   clipboard → clipboard + stdout
+
+примеры:
+  # скопируй ответ CC, запусти review
+  council
+
+  # DBA review SQL-запроса через пайп
+  echo "SELECT * FROM users WHERE email = 'test'" | council sql
+
+  # 3 раунда devil's advocate
+  council loop 3 devil
+
+лог сессии: ~/.council/session.md
+требует: gemini cli (npm install -g @google/gemini-cli)
+EOF
+}
+
+# --- main ---
+main() {
+    detect_clipboard
+    init_dir
+
+    local cmd="${1:-}"
+
+    case "${cmd}" in
+        help|--help|-h)
+            show_help
+            ;;
+        log)
+            show_log
+            ;;
+        clear)
+            clear_session
+            ;;
+        loop)
+            shift
+            run_loop "${1:-3}" "${2:-review}"
+            ;;
+        "")
+            run_council "review"
+            ;;
+        *)
+            run_council "${cmd}"
+            ;;
+    esac
+}
+
+main "$@"
