@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# conclave — многораундовые живые дебаты нейросетей
+# Gemini + GPT + Claude дискутируют N раундов, в конце Claude подводит итог
+set -euo pipefail
+
+SESSION_DIR="${HOME}/concilium/sessions"
+DEFAULT_ROUNDS=3
+
+# --- clipboard ---
+detect_clipboard() {
+    case "$(uname -s)" in
+        Darwin) CLIP_PASTE="pbpaste" ;;
+        Linux)  CLIP_PASTE="wl-paste" ;;
+        *)
+            echo "ошибка: неподдерживаемая ОС" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# --- инициализация директории ---
+init_dir() {
+    mkdir -p "${SESSION_DIR}"
+}
+
+# --- pipe или интерактив ---
+is_pipe_mode() {
+    [[ ! -t 0 ]]
+}
+
+# --- читать ввод ---
+read_input() {
+    local content
+    if is_pipe_mode; then
+        content="$(cat)"
+    else
+        content="$($CLIP_PASTE 2>/dev/null)" || true
+    fi
+    if [[ -z "${content}" ]]; then
+        echo "ошибка: нет входных данных (stdin пуст и clipboard пуст)" >&2
+        exit 1
+    fi
+    echo "${content}"
+}
+
+# --- timestamp ---
+timestamp() {
+    date "+%H:%M:%S"
+}
+
+# --- проверки ---
+check_gemini() {
+    if ! command -v gemini &>/dev/null; then
+        echo "ошибка: gemini cli не найден (npm install -g @google/gemini-cli)" >&2
+        exit 1
+    fi
+}
+
+check_codex() {
+    if ! command -v codex &>/dev/null; then
+        echo "ошибка: codex cli не найден (npm install -g @openai/codex)" >&2
+        exit 1
+    fi
+}
+
+# --- очистить markdown ---
+strip_markdown() {
+    sed \
+        -e 's/\*\*\([^*]*\)\*\*/\1/g' \
+        -e 's/\*\([^*]*\)\*/\1/g' \
+        -e 's/__\([^_]*\)__/\1/g' \
+        -e 's/_\([^_]*\)_/\1/g' \
+        -e 's/^### */  /g' \
+        -e 's/^## */  /g' \
+        -e 's/^# */  /g' \
+        -e 's/^---$/──────────/g' \
+        -e 's/`\([^`]*\)`/\1/g' \
+        -e '/^```/d'
+}
+
+# --- константы стиля ---
+FORMAT_PREFIX="ОБЯЗАТЕЛЬНО: отвечай ТОЛЬКО plain text. запрещены: ** (bold), ## (headers), * (italic), _ (italic), --- (hr), \`\`\` (code fences), \` (inline code). для выделения важного пиши CAPS. для блоков кода — отступ 4 пробела. списки через цифры или дефис."
+
+DEBATE_STYLE="СТИЛЬ: живые дебаты, не академический доклад. говори от первого лица. можно быть резким если аргумент слабый. НЕ НУЖНО: пересказывать слова оппонента перед ответом, расшаркиваться, говорить «хороший вопрос» или «отличное замечание»."
+
+FACTCHECK_RULE="ФАКТЧЕК: если кто-то говорит что-то фактически сомнительное или неверное — прямо укажи: «это под вопросом» или «это неверно, потому что...». не замалчивай ошибки из вежливости. если не знаешь — честно скажи «не уверен, нужно проверить»."
+
+OPPONENTS_RULE="ОППОНЕНТЫ: в дебатах участвуют Gemini, GPT и Claude. их позиции равнозначны — ни одна не имеет привилегий. оспаривай любую позицию если видишь изъяны, включая позицию Claude."
+
+# --- системный промпт по роли ---
+get_system_prompt() {
+    local role="$1"
+    local base
+    case "${role}" in
+        review) base="ты участник code review. анализируй решение: баги, edge cases, production-риски, что можно сделать лучше." ;;
+        alt)    base="предложи альтернативный подход к задаче. объясни trade-offs честно, не уклоняясь от минусов своего варианта." ;;
+        devil)  base="ищи всё что может сломаться: race conditions, масштабирование, человеческий фактор, edge cases, скрытые предположения." ;;
+        sql)    base="ты DBA. анализируй SQL/запросы/схему: deadlocks, N+1, индексы, implicit conversions, locking, data loss риски." ;;
+        sec)    base="security review: injection, auth bypass, SSRF, path traversal, privilege escalation, secrets в коде." ;;
+        *)      base="${role}" ;;
+    esac
+
+    printf '%s\n\n%s\n\n%s\n\n%s\n\n%s' \
+        "${FORMAT_PREFIX}" \
+        "${DEBATE_STYLE}" \
+        "${FACTCHECK_RULE}" \
+        "${OPPONENTS_RULE}" \
+        "${base}"
+}
+
+# --- отправить в Gemini ---
+# pipefail отключаем: gemini иногда выходит с non-zero даже при успехе,
+# а bash убьёт subshell до || true при set -e + assignment
+send_to_gemini() {
+    local prompt="$1"
+    set +o pipefail
+    local result
+    result="$(gemini -p "${prompt}" 2>/dev/null | strip_markdown)" || true
+    set -o pipefail
+    echo "${result}"
+}
+
+# --- отправить в GPT ---
+send_to_gpt() {
+    local prompt="$1"
+    set +o pipefail
+    local result
+    result="$(codex exec "${prompt}" --skip-git-repo-check -s read-only 2>/dev/null | strip_markdown)" || true
+    set -o pipefail
+    echo "${result}"
+}
+
+# --- записать в лог ---
+log_append() {
+    local logfile="$1"
+    local content="$2"
+    printf '%s\n\n' "${content}" >> "${logfile}"
+}
+
+# --- форматировать блок ---
+format_block() {
+    local round="$1"
+    local speaker="$2"
+    local content="$3"
+    printf '[conclave раунд %s — %s]\n\n%s' "${round}" "${speaker}" "${content}"
+}
+
+# --- основной флоу ---
+run_conclave() {
+    local rounds="$1"
+    local role="$2"
+
+    check_gemini
+    check_codex
+
+    local input
+    input="$(read_input)"
+
+    local sid
+    sid="conclave_$(date '+%Y-%m-%d_%H-%M-%S')"
+    local logfile="${SESSION_DIR}/${sid}.md"
+
+    # заголовок лога
+    {
+        printf '# conclave: %s\n' "${sid}"
+        printf '# роль: %s, раундов: %s\n' "${role}" "${rounds}"
+        printf '# дата: %s\n\n' "$(date)"
+        printf '## входной контекст\n\n%s\n\n---\n\n' "${input}"
+    } > "${logfile}"
+
+    echo "🏛️  conclave: ${rounds} раундов, роль: ${role}" >&2
+    echo "   лог: ${logfile}" >&2
+    echo "" >&2
+
+    local system_prompt
+    system_prompt="$(get_system_prompt "${role}")"
+
+    # накопленный транскрипт дебатов (без входного контекста)
+    local transcript=""
+    local gemini_resp gpt_resp
+    local gemini_block gpt_block
+    local gemini_prompt gpt_prompt
+    local round_chunk round_num
+
+    for (( round_num = 1; round_num <= rounds; round_num++ )); do
+
+        gemini_resp=""
+        gpt_resp=""
+        round_chunk=""
+
+        if [[ "${round_num}" -eq 1 ]]; then
+            # раунд 1: независимые ответы на задачу и позицию Claude
+            local r1_base
+            r1_base="РАУНД 1 (независимый). участники дебатов: ты, твой оппонент, и Claude. ниже — задача и позиция Claude (если есть). ответь на задачу и прямо отреагируй на позицию Claude: согласен или нет, что упустил, что добавишь.
+
+--- задача и контекст ---
+${input}
+--- конец ---"
+
+            gemini_prompt="${system_prompt}
+
+ты — GEMINI.
+${r1_base}"
+
+            gpt_prompt="${system_prompt}
+
+ты — GPT.
+${r1_base}"
+
+        else
+            # раунды 2+: каждый видит полный транскрипт, знает своё имя
+            local rN_base
+            rN_base="вот что было сказано до тебя — читай внимательно, потом отвечай.
+
+--- транскрипт дебатов ---
+${transcript}
+--- конец транскрипта ---
+
+исходная задача и контекст (включая позицию Claude если есть):
+--- задача ---
+${input}
+--- конец задачи ---
+
+ТВОЙ ХОД (раунд ${round_num}): продолжи дебаты. оспорь конкретные аргументы оппонентов с которыми не согласен, укажи на фактические ошибки если есть, развей свою позицию. НЕ ПОВТОРЯЙ то что уже сказал в предыдущих раундах."
+
+            gemini_prompt="${system_prompt}
+
+ты — GEMINI.
+${rN_base}"
+
+            gpt_prompt="${system_prompt}
+
+ты — GPT.
+${rN_base}"
+        fi
+
+        echo "⏳ раунд ${round_num}/${rounds}: Gemini..." >&2
+        gemini_resp="$(send_to_gemini "${gemini_prompt}")"
+
+        echo "⏳ раунд ${round_num}/${rounds}: GPT..." >&2
+        gpt_resp="$(send_to_gpt "${gpt_prompt}")"
+
+        if [[ -n "${gemini_resp}" ]]; then
+            gemini_block="$(format_block "${round_num}" "Gemini" "${gemini_resp}")"
+            round_chunk+="${gemini_block}"$'\n\n'
+            log_append "${logfile}" "${gemini_block}"$'\n──────────'
+        else
+            echo "⚠️  Gemini раунд ${round_num}: пустой ответ" >&2
+        fi
+
+        if [[ -n "${gpt_resp}" ]]; then
+            gpt_block="$(format_block "${round_num}" "GPT" "${gpt_resp}")"
+            round_chunk+="${gpt_block}"$'\n\n'
+            log_append "${logfile}" "${gpt_block}"$'\n──────────'
+        else
+            echo "⚠️  GPT раунд ${round_num}: пустой ответ" >&2
+        fi
+
+        # добавляем в транскрипт и выводим
+        transcript+="${round_chunk}"
+        printf '%s' "${round_chunk}"
+
+        echo "✓ раунд ${round_num} готов ($(timestamp))" >&2
+        echo "" >&2
+    done
+
+    # маркер для итога Claude
+    local final_marker
+    final_marker="=== ЗАДАНИЕ ДЛЯ CLAUDE: ПОДВЕДИ ИТОГ ===
+выше — стенограмма ${rounds} раундов дебатов между Gemini и GPT (позиция Claude в исходном контексте).
+1. пересскажи ход дебатов: кто с кем спорил, где разошлись, где согласились, кто кого поймал на слабом месте
+2. финальный вердикт: чья позиция наиболее обоснована и почему, или что осталось открытым
+=== КОНЕЦ CONCLAVE ==="
+
+    echo "${final_marker}"
+    log_append "${logfile}" "---"$'\n'"${final_marker}"
+
+    echo "" >&2
+    echo "🏁 conclave завершён. лог: ${logfile}" >&2
+}
+
+# --- справка ---
+show_help() {
+    cat << 'EOF'
+conclave — многораундовые дебаты нейросетей (Gemini + GPT + Claude)
+
+использование:
+  echo "тема/вопрос/код" | conclave [--rounds N] [роль]
+
+параметры:
+  --rounds N   количество раундов (по умолчанию 3)
+  роль         review, alt, devil, sql, sec, или произвольный текст
+
+участники:
+  Claude — даёт начальную позицию в исходном контексте (маркер: МОЙ ОТВЕТ (Claude):)
+  Gemini — полноправный участник дебатов
+  GPT    — полноправный участник дебатов
+
+как работает:
+  раунд 1: Gemini и GPT независимо отвечают на задачу и реагируют на позицию Claude
+  раунды 2+: каждый видит полный транскрипт и продолжает дебаты
+  финал:   маркер для итога Claude
+
+в фоне:
+  echo "тема" | conclave --rounds 4 > /tmp/cl.txt 2>&1 &
+  tail -f /tmp/cl.txt
+
+лог: ~/concilium/sessions/conclave_TIMESTAMP.md
+EOF
+}
+
+# --- main ---
+main() {
+    detect_clipboard
+    init_dir
+
+    local rounds="${DEFAULT_ROUNDS}"
+    local role="review"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rounds|-r)
+                if [[ -z "${2:-}" ]] || ! [[ "${2}" =~ ^[0-9]+$ ]]; then
+                    echo "ошибка: --rounds требует числовой аргумент" >&2
+                    exit 1
+                fi
+                rounds="$2"
+                shift 2
+                ;;
+            help|--help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                role="$1"
+                shift
+                ;;
+        esac
+    done
+
+    run_conclave "${rounds}" "${role}"
+}
+
+main "$@"
